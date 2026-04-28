@@ -9,7 +9,7 @@ Scan nearby avatars in Second Life, collect visible attachment data, and stream 
 
 ---
 
-## 🧠 Project Overview
+## Project Overview
 
 `hails.AVScanner` is an attachment scanning system designed to:
 
@@ -22,7 +22,7 @@ This is a **data collection layer**, not a full platform (yet).
 
 ---
 
-## 🚧 Current State (ALPHA)
+## Current State (ALPHA)
 
 - Core scanning logic implemented
 - Per-avatar processing (memory-safe)
@@ -38,7 +38,7 @@ Still evolving:
 
 ---
 
-## 📦 What You'll Need
+## What You'll Need
 
 - **Second Life**
   - Obviously.
@@ -51,7 +51,7 @@ Still evolving:
 
 ---
 
-## ⚠️ LIMITATIONS
+## LIMITATIONS
 
 - Only **public attachments** are visible
   - HUD attachments are NOT accessible
@@ -61,7 +61,7 @@ Still evolving:
 
 ---
 
-## 🔐 CRITICAL SECURITY NOTES
+## CRITICAL SECURITY NOTES
 
 - **ALL config files MUST be stored outside your web root**
 - **DO NOT expose your API key**
@@ -72,7 +72,7 @@ Still evolving:
 
 ---
 
-## 🧩 System Architecture
+## System Architecture
 
 ### 1. LSL Scanner
 - `hails.AVScanner`
@@ -100,7 +100,7 @@ Stores previous versions when changes occur
 
 ---
 
-## 🔄 Data Flow
+## Data Flow
 
 1. LSL scans avatars in region
 2. Processes one avatar at a time (memory-safe)
@@ -110,7 +110,7 @@ Stores previous versions when changes occur
 
 ---
 
-## ⚡️ Behavior
+## Behavior
 
 - Scans entire region
 - Processes avatars sequentially
@@ -121,7 +121,7 @@ Stores previous versions when changes occur
 
 ---
 
-## 🛠️ Setup Instructions
+## Setup Instructions
 
 ### 1. Configure API Endpoint
 
@@ -150,7 +150,7 @@ Ensure:
 
 ---
 
-## 🧪 Debugging
+## Debugging
 
 The script outputs:
 - Memory usage
@@ -167,7 +167,7 @@ If issues occur, check:
 
 ---
 
-## ⚠️ Common Issues
+## Common Issues
 
 - Stack-Heap Collision (memory overflow)
 - HTTP 420 (throttling)
@@ -176,7 +176,7 @@ If issues occur, check:
 
 ---
 
-## 📊 Future Plans
+## Future Plans
 
 - Improved data normalization?
 - Better batching efficiency?
@@ -186,7 +186,7 @@ If issues occur, check:
 
 ---
 
-## 🧾 Notes
+## Notes
 
 - Designed with memory safety first
 - Uses incremental processing, not full buffering
@@ -194,7 +194,7 @@ If issues occur, check:
 
 ---
 
-## 🚨 Final Notes
+## Final Notes
 
 This is an early-stage system.
 
