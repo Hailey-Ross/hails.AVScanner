@@ -110,17 +110,6 @@ Stores previous versions when changes occur
 
 ---
 
-## Behavior
-
-- Scans entire region
-- Processes avatars sequentially
-- Sends data in small batches
-- Handles HTTP throttling automatically
-- Waits 30 seconds after scan completion
-- Repeats continuously
-
----
-
 ## Setup Instructions
 
 ### 1. Configure API Endpoint
