@@ -22,7 +22,7 @@ Scan nearby avatars in Second Life, collect visible attachment data, and stream 
 
 ## Architecture
 
-The system uses a **coordinator + node** model across a multi-prim linkset. The root prim runs the Coordinator; each child prim runs a Node. Nodes work in parallel — more child prims means more concurrent workers.
+The system uses a **coordinator + node** model across a multi-prim linkset. The root prim runs the Coordinator; each child prim runs a Node. Nodes work in parallel, more child prims means more concurrent workers.
 
 ### Scripts
 
@@ -102,11 +102,11 @@ Historical snapshots moved here whenever an attachment record changes. Links bac
 
 ## What You'll Need
 
-- **Second Life** — obviously
-- **Multi-prim in-world object** — root prim for Coordinator, one or more child prims for Nodes
-- **Webserver** — Apache or Nginx recommended
-- **Database** — MySQL / MariaDB
-- **PHP** — PHP 8+ recommended
+- **Second Life** obviously
+- **Multi-prim in-world object** root prim for Coordinator, one or more child prims for Nodes
+- **Webserver** Apache or Nginx recommended
+- **Database** MySQL / MariaDB
+- **PHP** PHP 8+ recommended
 
 ---
 
@@ -175,7 +175,7 @@ Set `DEBUG = TRUE` in either script for verbose `llOwnerSay` output covering:
 - **Store `config.php` outside your web root**
 - **Do NOT expose your API key**
 - **Do NOT log raw payloads publicly**
-- **Never trust incoming data without validation** — the PHP layer normalises all fields
+- **Never trust incoming data without validation**, the PHP layer normalises all fields
 
 > If your API endpoint or config is publicly accessible, your system is compromised.
 
@@ -186,10 +186,10 @@ Set `DEBUG = TRUE` in either script for verbose `llOwnerSay` output covering:
 | Symptom | Likely cause |
 |---|---|
 | Node immediately reports error | Avatar left region before node processed them |
-| HTTP 420 loops | Too many nodes hitting the API too fast — increase `REQUEST_DELAY` or reduce node count |
-| Stack-Heap Collision | LSL memory exceeded — reduce `MAX_RECORDS_PER_REQUEST` or attachment batch size |
+| HTTP 420 loops | Too many nodes hitting the API too fast, increase `REQUEST_DELAY` or reduce node count |
+| Stack-Heap Collision | LSL memory exceeded, reduce `MAX_RECORDS_PER_REQUEST` or attachment batch size |
 | No data in database | Check API key match, PHP error log, DB connectivity |
-| Coordinator never finishes | A node silently died — touch to reset and restart |
+| Coordinator never finishes | A node silently died, touch to reset and restart |
 
 ---
 
