@@ -17,7 +17,7 @@ Scan nearby avatars in Second Life, collect visible attachment data, and stream 
 
 ## Architecture
 
-The system uses a **coordinator + node** model across a multi-prim linkset. The root prim runs the Coordinator; each child prim runs a Node. Nodes work in parallel — more child prims means more concurrent workers.
+The system uses a **coordinator + node** model across a multi-prim linkset. The root prim runs the Coordinator; each child prim runs a Node. Nodes work in parallel. More child prims means more concurrent workers.
 
 ### Scripts
 
@@ -69,7 +69,7 @@ Coordinator and nodes communicate via `llMessageLinked` using large random integ
 - Tracks pending count; calls `finish_scan()` when all nodes have reported back
 - Listens on **channel 2** for owner chat commands (see Commands section)
 - Resets automatically on owner, region, or linkset change
-- On linkset change (`CHANGED_LINK`): clears node lists, re-broadcasts `MSG_RESET_NODES`, and re-collects all nodes — preserving cooldown history
+- On linkset change (`CHANGED_LINK`): clears node lists, re-broadcasts `MSG_RESET_NODES`, and re-collects all nodes while preserving cooldown history
 
 ### 2. Node (`hails.AVScanner-Node.lsl`)
 
@@ -78,7 +78,7 @@ Coordinator and nodes communicate via `llMessageLinked` using large random integ
 - Fetches `llGetAttachedList` and iterates attachments in chunks
 - Retries on HTTP 420 with configurable backoff (`THROTTLE_BACKOFF`)
 - **Watchdog timer**: if no coordinator message is received within `WATCHDOG_TIMEOUT` (120s), the node turns blue and re-registers itself automatically
-- On linkset change (`CHANGED_LINK`): updates its link number — re-registration follows when coordinator sends `MSG_RESET_NODES`
+- On linkset change (`CHANGED_LINK`): updates its link number; re-registration follows when the coordinator sends `MSG_RESET_NODES`
 - Config values set per-node:
 
 ```lsl
@@ -114,8 +114,8 @@ Type these in local chat on **channel 2** (prefix with `/2`). Only the object ow
 
 | Command | Effect |
 |---|---|
-| `hailsAV debug` | Toggle standard debug output on/off (level 0 ↔ 1) |
-| `hailsAV debug verbose` | Toggle verbose debug output on/off (level 0 ↔ 2) |
+| `hailsAV debug` | Toggle standard debug output on/off (level 0 to 1) |
+| `hailsAV debug verbose` | Toggle verbose debug output on/off (level 0 to 2) |
 | `hailsAV disable` | Pause scanning after the current cycle completes |
 | `hailsAV enable` | Resume scanning |
 
@@ -127,7 +127,7 @@ Debug level is relayed to all nodes automatically via `MSG_SET_DEBUG`.
 
 | Level | How to set | Output |
 |---|---|---|
-| `0` (off) | Default; `hailsAV debug` when on | Complete silence |
+| `0` (off) | Default; or `hailsAV debug` when already on | Complete silence |
 | `1` (standard) | `hailsAV debug` | Scan start/complete, node DONE/ERROR counts, cooldown notices, watchdog events |
 | `2` (verbose) | `hailsAV debug verbose` | Everything in level 1, plus per-avatar assignment, HTTP status per chunk, memory readouts, node registration details |
 
@@ -137,11 +137,11 @@ Command acknowledgments (`Debug ON`, `Scanning paused`, etc.) are always shown r
 
 ## What You'll Need
 
-- **Second Life** obviously
-- **Multi-prim in-world object** — root prim for Coordinator, one or more child prims for Nodes
-- **Webserver** — Apache or Nginx recommended
-- **Database** — MySQL / MariaDB
-- **PHP** — PHP 8+ recommended
+- **Second Life**
+- **Multi-prim in-world object**: root prim for Coordinator, one or more child prims for Nodes
+- **Webserver**: Apache or Nginx recommended
+- **Database**: MySQL or MariaDB
+- **PHP**: PHP 8+ recommended
 
 ---
 
@@ -173,12 +173,12 @@ Set `API_URL` and `API_KEY` in `hails.AVScanner-Node.lsl` to match your backend 
 
 ### 5. Build the In-World Object
 
-1. Create a linkset — one root prim plus as many child prims as you want parallel nodes (2–4 is a reasonable start)
+1. Create a linkset with one root prim and as many child prims as you want parallel nodes (2-4 is a reasonable start)
 2. Place `hails.AVScanner-Coordinator.lsl` in the **root prim**
 3. Place `hails.AVScanner-Node.lsl` in each **child prim**
 4. Scripts start automatically; nodes register with the coordinator during the 3-second startup window
 
-You can add or remove node prims at any time — `CHANGED_LINK` triggers automatic re-collection of all nodes.
+You can add or remove node prims at any time. `CHANGED_LINK` triggers automatic re-collection of all nodes.
 
 ### 6. Start a Scan
 
@@ -188,10 +188,10 @@ Touch the object. The owner can touch to trigger a manual scan at any time. The 
 
 ## Limitations
 
-- Only **public attachments** are visible — HUD attachments are not accessible
+- Only **public attachments** are visible; HUD attachments are not accessible
 - `llGetAttachedList` requires the avatar to still be in region when the node processes them
 - Subject to LSL HTTP throttling (handled via backoff, but adds latency)
-- LSL memory limits apply per script; keep `MAX_RECORDS_PER_REQUEST` small (1–3)
+- LSL memory limits apply per script; keep `MAX_RECORDS_PER_REQUEST` small (1-3)
 
 ---
 
@@ -200,7 +200,7 @@ Touch the object. The owner can touch to trigger a manual scan at any time. The 
 - **Store `config.php` outside your web root**
 - **Do NOT expose your API key**
 - **Do NOT log raw payloads publicly**
-- **Never trust incoming data without validation** — the PHP layer normalises all fields
+- **Never trust incoming data without validation.** The PHP layer normalises all fields.
 
 > If your API endpoint or config is publicly accessible, your system is compromised.
 
@@ -215,7 +215,7 @@ Touch the object. The owner can touch to trigger a manual scan at any time. The 
 | Stack-Heap Collision | LSL memory exceeded; reduce `MAX_RECORDS_PER_REQUEST` |
 | No data in database | Check API key match, PHP error log, DB connectivity |
 | Node stuck blue and not working | Watchdog should recover it within 120s; if not, reset the object |
-| Same avatar scanned every cycle | Check `SCAN_COOLDOWN` — default is 180s between rescans of the same avatar |
+| Same avatar scanned every cycle | Check `SCAN_COOLDOWN` (default 180s between rescans of the same avatar) |
 
 ---
 
