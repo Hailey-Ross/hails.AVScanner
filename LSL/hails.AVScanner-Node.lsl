@@ -9,7 +9,7 @@ integer MSG_ABORT_SCAN  = 6;
 // ── Config ──
 string  API_URL                 = "https://YOUR-SITE-HERE.com/attachments_ingest.php";
 string  API_KEY                 = "YOUR-API-KEY";
-integer DEBUG                   = FALSE;
+integer DEBUG                   = TRUE;
 integer MAX_RECORDS_PER_REQUEST = 2;
 float   REQUEST_DELAY           = 1.0;
 float   THROTTLE_BACKOFF        = 2.5;
@@ -159,6 +159,12 @@ send_next_chunk()
 
     if (recordsJson == "")
     {
+        if (DEBUG)
+        {
+            llOwnerSay("[Node " + (string)gMyLinkNumber + "] Chunk produced 0 records for "
+                + gAvatarName + " | processed=" + (string)gAttachmentIndex
+                + "/" + (string)totalAttachments);
+        }
         if (gAttachmentIndex >= totalAttachments)
         {
             reset_node_state();
@@ -198,17 +204,11 @@ start_avatar_scan(string avatarUuidStr)
 {
     key avatarId = (key)avatarUuidStr;
 
-    string avatarName = llKey2Name(avatarId);
-    if (avatarName == "")
-    {
-        report_error("avatar not in region");
-        return;
-    }
-
     list attachments = llGetAttachedList(avatarId);
 
     if (llGetListLength(attachments) == 0)
     {
+        if (DEBUG) llOwnerSay("[Node " + (string)gMyLinkNumber + "] No attachments: " + avatarUuidStr);
         report_done();
         return;
     }
@@ -218,9 +218,18 @@ start_avatar_scan(string avatarUuidStr)
         string sentinel = llList2String(attachments, 0);
         if (sentinel == "NOT FOUND" || sentinel == "NOT ON REGION")
         {
+            if (DEBUG) llOwnerSay("[Node " + (string)gMyLinkNumber + "] Sentinel '" + sentinel + "': " + avatarUuidStr);
             report_error(sentinel);
             return;
         }
+    }
+
+    // llKey2Name only resolves avatars within render distance; fall back to UUID
+    // so out-of-range avatars are still scanned rather than silently dropped.
+    string avatarName = llKey2Name(avatarId);
+    if (avatarName == "")
+    {
+        avatarName = avatarUuidStr;
     }
 
     gAvatarId        = avatarUuidStr;
