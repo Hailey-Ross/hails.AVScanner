@@ -219,4 +219,4 @@ Touch the object. The owner can touch to trigger a manual scan at any time. The 
 
 ---
 
-Built by Hails
+Built by Hails ❤️
