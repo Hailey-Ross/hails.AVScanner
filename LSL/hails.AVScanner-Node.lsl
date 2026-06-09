@@ -1,4 +1,3 @@
-// ── Message protocol constants (must match Coordinator script) ──
 integer MSG_NODE_READY  = 1;
 integer MSG_ASSIGN      = 2;
 integer MSG_NODE_DONE   = 3;
@@ -6,7 +5,6 @@ integer MSG_NODE_ERROR  = 4;
 integer MSG_RESET_NODES = 5;
 integer MSG_ABORT_SCAN  = 6;
 
-// ── Config ──
 string  API_URL                 = "https://YOUR-SITE-HERE.com/attachments_ingest.php";
 string  API_KEY                 = "YOUR-API-KEY";
 integer DEBUG                   = TRUE;
@@ -14,17 +12,18 @@ integer MAX_RECORDS_PER_REQUEST = 2;
 float   REQUEST_DELAY           = 1.0;
 float   THROTTLE_BACKOFF        = 2.5;
 
-// ── State ──
+vector COLOR_IDLE    = <0.0, 1.0, 0.0>;
+vector COLOR_WORKING = <0.0, 0.0, 1.0>;
+vector COLOR_ERROR   = <1.0, 0.0, 0.0>;
+
 integer gMyLinkNumber      = 0;
 string  gAvatarId          = "";
 string  gAvatarName        = "";
 list    gAttachments       = [];
 integer gAttachmentIndex   = 0;
-string  gPendingChunkJson  = "";   // saved payload for 420 retry — cleared on success
+string  gPendingChunkJson  = "";
 key     gActiveRequest     = NULL_KEY;
 integer gWaitingToContinue = FALSE;
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 string json_escape(string s)
 {
@@ -66,7 +65,7 @@ reset_node_state()
 
 announce_ready()
 {
-    // sender_num in coordinator's link_message will be gMyLinkNumber
+    llSetColor(COLOR_IDLE, ALL_SIDES);
     llMessageLinked(LINK_ROOT, MSG_NODE_READY, "", NULL_KEY);
 }
 
@@ -82,8 +81,9 @@ report_error(string reason)
     {
         llOwnerSay("[Node " + (string)gMyLinkNumber + "] Error: " + reason);
     }
+    llSetColor(COLOR_ERROR, ALL_SIDES);
     llMessageLinked(LINK_ROOT, MSG_NODE_ERROR, reason, NULL_KEY);
-    announce_ready();
+    llMessageLinked(LINK_ROOT, MSG_NODE_READY, "", NULL_KEY);
 }
 
 send_next_chunk()
@@ -202,6 +202,8 @@ send_next_chunk()
 
 start_avatar_scan(string avatarUuidStr)
 {
+    llSetColor(COLOR_WORKING, ALL_SIDES);
+
     key avatarId = (key)avatarUuidStr;
 
     list attachments = llGetAttachedList(avatarId);
@@ -224,8 +226,6 @@ start_avatar_scan(string avatarUuidStr)
         }
     }
 
-    // llKey2Name only resolves avatars within render distance; fall back to UUID
-    // so out-of-range avatars are still scanned rather than silently dropped.
     string avatarName = llKey2Name(avatarId);
     if (avatarName == "")
     {
@@ -246,8 +246,6 @@ start_avatar_scan(string avatarUuidStr)
     send_next_chunk();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 default
 {
     state_entry()
@@ -255,7 +253,6 @@ default
         gMyLinkNumber = llGetLinkNumber();
         reset_node_state();
         llOwnerSay("[Node " + (string)gMyLinkNumber + "] Ready.");
-        announce_ready();
     }
 
     link_message(integer sender_num, integer num, string str, key id)
@@ -270,6 +267,7 @@ default
         if (num == MSG_ABORT_SCAN)
         {
             reset_node_state();
+            llSetColor(COLOR_ERROR, ALL_SIDES);
             return;
         }
 
