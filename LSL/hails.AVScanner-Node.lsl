@@ -1,16 +1,22 @@
-integer MSG_NODE_READY  = 1;
-integer MSG_ASSIGN      = 2;
-integer MSG_NODE_DONE   = 3;
-integer MSG_NODE_ERROR  = 4;
-integer MSG_RESET_NODES = 5;
-integer MSG_ABORT_SCAN  = 6;
+// ── Message protocol constants (must match Coordinator script) ──
+integer MSG_NODE_READY  = 3101520;
+integer MSG_ASSIGN      = 5676979;
+integer MSG_NODE_DONE   = 2195870;
+integer MSG_NODE_ERROR  = 8190093;
+integer MSG_RESET_NODES = 1210977;
+integer MSG_ABORT_SCAN  = 2798014;
+integer MSG_SET_DEBUG   = 4927361;
 
+// ── Config ──
+// DEBUG levels: 0 = silent, 1 = standard, 2 = verbose
+// Controlled by coordinator via MSG_SET_DEBUG relay
 string  API_URL                 = "https://YOUR-SITE-HERE.com/attachments_ingest.php";
 string  API_KEY                 = "YOUR-API-KEY";
-integer DEBUG                   = TRUE;
+integer DEBUG                   = 0;
 integer MAX_RECORDS_PER_REQUEST = 2;
 float   REQUEST_DELAY           = 1.0;
 float   THROTTLE_BACKOFF        = 2.5;
+integer WATCHDOG_TIMEOUT        = 120;  // seconds of coordinator silence before re-registering
 
 vector COLOR_IDLE    = <0.0, 1.0, 0.0>;
 vector COLOR_WORKING = <0.0, 0.0, 1.0>;
@@ -65,25 +71,26 @@ reset_node_state()
 
 announce_ready()
 {
+    if (DEBUG >= 1)
+        llOwnerSay("[Node " + (string)gMyLinkNumber + "] ANNOUNCE_READY scanning=" + (string)(gAvatarId != ""));
     llSetColor(COLOR_IDLE, ALL_SIDES);
     llMessageLinked(LINK_ROOT, MSG_NODE_READY, "", NULL_KEY);
+    llSetTimerEvent(WATCHDOG_TIMEOUT);
 }
 
 report_done()
 {
+    if (DEBUG >= 1) llOwnerSay("[Node " + (string)gMyLinkNumber + "] REPORT_DONE");
     llMessageLinked(LINK_ROOT, MSG_NODE_DONE, "", NULL_KEY);
-    announce_ready();
+    llSetTimerEvent(WATCHDOG_TIMEOUT);
 }
 
 report_error(string reason)
 {
-    if (DEBUG)
-    {
-        llOwnerSay("[Node " + (string)gMyLinkNumber + "] Error: " + reason);
-    }
+    if (DEBUG >= 1) llOwnerSay("[Node " + (string)gMyLinkNumber + "] REPORT_ERROR: " + reason);
     llSetColor(COLOR_ERROR, ALL_SIDES);
     llMessageLinked(LINK_ROOT, MSG_NODE_ERROR, reason, NULL_KEY);
-    llMessageLinked(LINK_ROOT, MSG_NODE_READY, "", NULL_KEY);
+    llSetTimerEvent(WATCHDOG_TIMEOUT);
 }
 
 send_next_chunk()
@@ -159,7 +166,7 @@ send_next_chunk()
 
     if (recordsJson == "")
     {
-        if (DEBUG)
+        if (DEBUG >= 2)
         {
             llOwnerSay("[Node " + (string)gMyLinkNumber + "] Chunk produced 0 records for "
                 + gAvatarName + " | processed=" + (string)gAttachmentIndex
@@ -180,7 +187,7 @@ send_next_chunk()
 
     gPendingChunkJson = "{\"api_key\":\"" + json_escape(API_KEY) + "\",\"records\":[" + recordsJson + "]}";
 
-    if (DEBUG)
+    if (DEBUG >= 2)
     {
         llOwnerSay("[Node " + (string)gMyLinkNumber + "] Sending " + (string)added
             + " record(s) for " + gAvatarName
@@ -202,6 +209,7 @@ send_next_chunk()
 
 start_avatar_scan(string avatarUuidStr)
 {
+    if (DEBUG >= 1) llOwnerSay("[Node " + (string)gMyLinkNumber + "] START_SCAN: " + avatarUuidStr);
     llSetColor(COLOR_WORKING, ALL_SIDES);
 
     key avatarId = (key)avatarUuidStr;
@@ -210,7 +218,7 @@ start_avatar_scan(string avatarUuidStr)
 
     if (llGetListLength(attachments) == 0)
     {
-        if (DEBUG) llOwnerSay("[Node " + (string)gMyLinkNumber + "] No attachments: " + avatarUuidStr);
+        if (DEBUG >= 2) llOwnerSay("[Node " + (string)gMyLinkNumber + "] No attachments: " + avatarUuidStr);
         report_done();
         return;
     }
@@ -220,7 +228,7 @@ start_avatar_scan(string avatarUuidStr)
         string sentinel = llList2String(attachments, 0);
         if (sentinel == "NOT FOUND" || sentinel == "NOT ON REGION")
         {
-            if (DEBUG) llOwnerSay("[Node " + (string)gMyLinkNumber + "] Sentinel '" + sentinel + "': " + avatarUuidStr);
+            if (DEBUG >= 2) llOwnerSay("[Node " + (string)gMyLinkNumber + "] Sentinel '" + sentinel + "': " + avatarUuidStr);
             report_error(sentinel);
             return;
         }
@@ -237,7 +245,7 @@ start_avatar_scan(string avatarUuidStr)
     gAttachments     = attachments;
     gAttachmentIndex = 0;
 
-    if (DEBUG)
+    if (DEBUG >= 2)
     {
         llOwnerSay("[Node " + (string)gMyLinkNumber + "] Scanning: " + gAvatarName
             + " | attachments: " + (string)llGetListLength(gAttachments));
@@ -252,13 +260,24 @@ default
     {
         gMyLinkNumber = llGetLinkNumber();
         reset_node_state();
-        llOwnerSay("[Node " + (string)gMyLinkNumber + "] Ready.");
+        if (DEBUG >= 1) llOwnerSay("[Node " + (string)gMyLinkNumber + "] Ready.");
+        announce_ready();
     }
 
     link_message(integer sender_num, integer num, string str, key id)
     {
+        if (sender_num != LINK_ROOT) return;
+
+        if (num == MSG_SET_DEBUG)
+        {
+            DEBUG = (integer)str;
+            return;
+        }
+
         if (num == MSG_RESET_NODES)
         {
+            if (DEBUG >= 1)
+                llOwnerSay("[Node " + (string)gMyLinkNumber + "] RESET from link " + (string)sender_num);
             reset_node_state();
             announce_ready();
             return;
@@ -268,6 +287,7 @@ default
         {
             reset_node_state();
             llSetColor(COLOR_ERROR, ALL_SIDES);
+            llSetTimerEvent(WATCHDOG_TIMEOUT);
             return;
         }
 
@@ -287,14 +307,14 @@ default
 
         gActiveRequest = NULL_KEY;
 
-        if (DEBUG)
+        if (DEBUG >= 2)
         {
             llOwnerSay("[Node " + (string)gMyLinkNumber + "] HTTP " + (string)status);
         }
 
         if (status == 420)
         {
-            if (DEBUG)
+            if (DEBUG >= 2)
             {
                 llOwnerSay("[Node " + (string)gMyLinkNumber + "] Throttled. Retrying in " + (string)THROTTLE_BACKOFF + "s.");
             }
@@ -307,7 +327,7 @@ default
 
         if (status < 200 || status >= 300)
         {
-            if (DEBUG)
+            if (DEBUG >= 2)
             {
                 llOwnerSay("[Node " + (string)gMyLinkNumber + "] HTTP error " + (string)status + ". Skipping chunk.");
             }
@@ -342,7 +362,20 @@ default
             }
 
             send_next_chunk();
+            return;
         }
+
+        // Watchdog: no coordinator contact for WATCHDOG_TIMEOUT seconds
+        if (DEBUG >= 1) llOwnerSay("[Node " + (string)gMyLinkNumber + "] Watchdog: re-registering.");
+        reset_node_state();
+        llSetColor(COLOR_WORKING, ALL_SIDES);
+        llMessageLinked(LINK_ROOT, MSG_NODE_READY, "", NULL_KEY);
+        llSetTimerEvent(WATCHDOG_TIMEOUT);
+    }
+
+    on_rez(integer start_param)
+    {
+        llResetScript();
     }
 
     changed(integer change)
@@ -350,6 +383,12 @@ default
         if (change & (CHANGED_OWNER | CHANGED_REGION | CHANGED_REGION_START))
         {
             llResetScript();
+        }
+        else if (change & CHANGED_LINK)
+        {
+            // Link numbers shift when prims are linked/unlinked — update ours
+            // Coordinator will send MSG_RESET_NODES which triggers re-registration
+            gMyLinkNumber = llGetLinkNumber();
         }
     }
 }

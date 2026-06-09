@@ -82,6 +82,8 @@ if (!is_array($records) || empty($records)) {
     respond_and_exit('No records supplied', 400);
 }
 
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
 $mysqli = new mysqli(DB_SERVER, DB_USERNAME, DB_PASSWORD, ATTACHMENTS_DB_NAME);
 if ($mysqli->connect_errno) {
     respond_and_exit('Database connection failed: ' . $mysqli->connect_error, 500);

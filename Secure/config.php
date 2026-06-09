@@ -9,7 +9,7 @@ define('DB_SERVER', 'localhost');
 define('DB_USERNAME', 'YOUR-USER-NAME');
 define('DB_PASSWORD', 'YOUR-PASSWORD-HERE');
 
-define('ATTACHMENTS_DB_NAME', 'avscanner');
+define('ATTACHMENTS_DB_NAME', 'mtnbound_avscanner');
 define('ATTACHMENTS_API_KEY', 'YOUR-SECURE-API-KEY');
 
 ?>
