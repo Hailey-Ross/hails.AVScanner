@@ -6,14 +6,27 @@ integer MSG_NODE_ERROR  = 8190093;
 integer MSG_RESET_NODES = 1210977;
 integer MSG_ABORT_SCAN  = 2798014;
 integer MSG_SET_DEBUG   = 4927361;
+integer MSG_SET_PACING  = 6602143;
+integer MSG_WIPE_NODES  = 7245013;
+
+// ── Deployment (must match Node script) ──
+// Node scripts set this PIN on their prim via llSetRemoteScriptAccessPin,
+// which lets do_deploy() push script updates with llRemoteLoadScriptPin.
+// Order is always deploy -> verify registrations -> cleanup; never wipe
+// before deploying (PIN persistence after a full wipe is undocumented).
+integer DEPLOY_PIN         = 84150193;
+string  NODE_SCRIPT_PREFIX = "hails.AVScanner_Node";
 
 // ── Config ──
 // DEBUG levels: 0 = silent, 1 = standard, 2 = verbose
 // Toggle with '/2 hailsAV debug' (standard) or '/2 hailsAV debug verbose'
 integer DEBUG           = 0;
 float   RESCAN_DELAY    = 30.0;
-float   NODE_WAIT_DELAY = 3.0;
 integer SCAN_COOLDOWN   = 180;    // seconds before an avatar is eligible for rescan
+// Max avatars assigned at once. The object-wide HTTP cap (25 req/20s) fixes
+// total scan time regardless of parallelism, so extra concurrency only adds
+// burst load on the backend (HTTP 499s) and per-avatar latency.
+integer MAX_ACTIVE_WORKERS = 10;
 
 // ── State ──
 list    gAvatarQueue     = [];
@@ -28,9 +41,14 @@ list    gScannedAvatars  = [];  // UUIDs scanned this session; parallel with gSc
 list    gScannedTimes    = [];  // llGetUnixTime() of each avatar's last successful scan
 integer gScanActive      = FALSE;
 integer gWaitingToRescan = FALSE;
-integer gCollectingNodes = FALSE;
 integer gDisabled        = FALSE;
 integer gListenHandle    = 0;
+integer gWipeArmedUntil  = 0;   // unix time; wipe executes only if re-confirmed before this
+integer gPacedWorkers    = 1;   // worker count last broadcast via MSG_SET_PACING; ramps up mid-scan
+integer gDeployReport    = FALSE; // verify-registrations timer pending after a deploy
+integer gDeployTargets   = 0;   // prim count of the last deploy, for the verify report
+integer gAutoCleanup     = FALSE; // redeploy: run cleanup automatically if every prim registered
+integer gAwaitingCleanup = FALSE; // deploy done but cleanup pending; scanning stays paused
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -46,10 +64,134 @@ integer is_agent_list_error(list agents)
     return FALSE;
 }
 
+abort_scan_state()
+{
+    llSetTimerEvent(0.0);
+    gAvatarQueue     = [];
+    gQueueIndex      = 0;
+    gPendingCount    = 0;
+    gReadyNodes      = [];
+    gAssignedNodes   = [];
+    gAssignedAvatars = [];
+    gRetryQueue      = [];
+    gSkippedAvatars  = [];
+    gScanActive      = FALSE;
+    gWaitingToRescan = FALSE;
+    gPacedWorkers    = 1;
+    gDeployReport    = FALSE;
+    gAutoCleanup     = FALSE;
+    gAwaitingCleanup = FALSE;
+}
+
+// Returns the single node script in the root prim's inventory, or "" after
+// telling the owner why (none found, or ambiguous)
+string find_node_script()
+{
+    string  found   = "";
+    integer matches = 0;
+    integer i;
+    for (i = 0; i < llGetInventoryNumber(INVENTORY_SCRIPT); i++)
+    {
+        string itemName = llGetInventoryName(INVENTORY_SCRIPT, i);
+        if (llSubStringIndex(itemName, NODE_SCRIPT_PREFIX) == 0)
+        {
+            found = itemName;
+            matches++;
+        }
+    }
+    if (matches == 0)
+    {
+        llOwnerSay("[Coord] No script starting with '" + NODE_SCRIPT_PREFIX
+            + "' found in the root prim. Drop the node script in and try again.");
+        return "";
+    }
+    if (matches > 1)
+    {
+        llOwnerSay("[Coord] Found " + (string)matches + " scripts starting with '"
+            + NODE_SCRIPT_PREFIX + "' in the root prim. Keep exactly one and try again.");
+        return "";
+    }
+    return found;
+}
+
+do_wipe()
+{
+    abort_scan_state();
+    llMessageLinked(LINK_ALL_OTHERS, MSG_WIPE_NODES, "", NULL_KEY);
+    llOwnerSay("[Coord] Wipe broadcast sent. Node scripts are deleting themselves.");
+}
+
+do_deploy(string scriptName)
+{
+    abort_scan_state();
+
+    // Pause scanning fully: stop in-flight node work too, so nothing scans
+    // or POSTs while scripts are being replaced under it. Scanning stays
+    // paused until cleanup (see the gAwaitingCleanup guard in start_scan)
+    llMessageLinked(LINK_ALL_OTHERS, MSG_ABORT_SCAN, "", NULL_KEY);
+
+    // llGetObjectPrimCount excludes seated avatars but returns 0 when the
+    // object is an attachment; fall back to llGetNumberOfPrims there (nobody
+    // can sit on an attachment, so it is exact in that case)
+    integer primCount = llGetObjectPrimCount(llGetKey());
+    if (primCount <= 0)
+    {
+        primCount = llGetNumberOfPrims();
+    }
+    integer targets = primCount - 1;
+    if (targets < 1)
+    {
+        llOwnerSay("[Coord] No child prims found to deploy to.");
+        return;
+    }
+    llOwnerSay("[Coord] Deploying '" + scriptName + "' to " + (string)targets
+        + " prims. llRemoteLoadScriptPin sleeps 3s per prim; expect ~"
+        + (string)(targets * 3) + "s.");
+
+    integer link;
+    for (link = 2; link <= primCount; link++)
+    {
+        llRemoteLoadScriptPin(llGetLinkKey(link), scriptName, DEPLOY_PIN, TRUE, 0);
+        if ((link - 1) % 10 == 0 && link < primCount)
+        {
+            llOwnerSay("[Coord] Pushed to " + (string)(link - 1) + "/" + (string)targets + " prims...");
+        }
+    }
+
+    // Destroy NOTHING yet. Loaded scripts announce themselves as they start;
+    // the verify timer reports how many actually registered before any
+    // cleanup happens. (A failed llRemoteLoadScriptPin only shouts on
+    // DEBUG_CHANNEL, so registrations are the only reliable success signal.)
+    gDeployTargets   = targets;
+    gDeployReport    = TRUE;
+    gAwaitingCleanup = TRUE;
+    llSetTimerEvent(10.0);
+    llOwnerSay("[Coord] Push finished. Scanning is paused until cleanup. Verifying registrations for 10s...");
+}
+
+do_cleanup()
+{
+    string scriptName = find_node_script();
+    if (scriptName == "")
+    {
+        return;
+    }
+
+    // Nodes delete every other node-script version in their prim, keeping
+    // only scriptName; then the staged root copy is removed
+    llMessageLinked(LINK_ALL_OTHERS, MSG_WIPE_NODES, scriptName, NULL_KEY);
+    llRemoveInventory(scriptName);
+    gAwaitingCleanup = FALSE;
+    llOwnerSay("[Coord] Cleanup done: prims keep only '" + scriptName
+        + "', staged copy removed from the root prim. Starting scan.");
+    start_scan();
+}
+
 dispatch_to_ready_nodes()
 {
     integer queueLen = llGetListLength(gAvatarQueue);
     while (llGetListLength(gReadyNodes) > 0
+           && gPendingCount < MAX_ACTIVE_WORKERS
            && (llGetListLength(gRetryQueue) > 0 || gQueueIndex < queueLen))
     {
         integer nodeLink = llList2Integer(gReadyNodes, 0);
@@ -77,6 +219,16 @@ dispatch_to_ready_nodes()
         {
             llOwnerSay("[Coord] -> Node " + (string)nodeLink + " | " + (string)avatarId);
         }
+    }
+
+    // Ramp pacing up as workers actually join (nodes register dynamically;
+    // scans no longer wait for a collection window). Broadcast only on
+    // increase to keep link traffic down; gPendingCount is capped at
+    // MAX_ACTIVE_WORKERS by the loop above.
+    if (gScanActive && gPendingCount > gPacedWorkers)
+    {
+        gPacedWorkers = gPendingCount;
+        llMessageLinked(LINK_ALL_OTHERS, MSG_SET_PACING, (string)gPacedWorkers, NULL_KEY);
     }
 }
 
@@ -120,6 +272,13 @@ start_scan()
 {
     llSetTimerEvent(0.0);
     gWaitingToRescan = FALSE;
+
+    if (gAwaitingCleanup)
+    {
+        llOwnerSay("[Coord] Deploy is awaiting cleanup; scanning stays paused."
+            + " Say 'hailsAV cleanup' to finish the upgrade and resume.");
+        return;
+    }
 
     if (gDisabled) return;
 
@@ -184,6 +343,18 @@ start_scan()
     gAvatarQueue = filteredQueue;
     integer agentCount = llGetListLength(gAvatarQueue);
 
+    // Tell nodes how many of them will be sending HTTP concurrently so they
+    // can pace against the object-wide throttle (25 requests/20s for the
+    // whole linkset). Concurrency = min(ready nodes, queued avatars,
+    // MAX_ACTIVE_WORKERS); counting idle nodes would make the send gap
+    // needlessly long.
+    integer workerCount = llGetListLength(gReadyNodes);
+    if (agentCount < workerCount) workerCount = agentCount;
+    if (workerCount > MAX_ACTIVE_WORKERS) workerCount = MAX_ACTIVE_WORKERS;
+    if (workerCount < 1) workerCount = 1;
+    gPacedWorkers = workerCount;
+    llMessageLinked(LINK_ALL_OTHERS, MSG_SET_PACING, (string)workerCount, NULL_KEY);
+
     gQueueIndex      = 0;
     gPendingCount    = 0;
     gAssignedNodes   = [];
@@ -208,28 +379,20 @@ default
 {
     state_entry()
     {
-        gScanActive      = FALSE;
-        gCollectingNodes = TRUE;
-        gWaitingToRescan = FALSE;
-        gDisabled        = FALSE;
-        gReadyNodes      = [];
-        gAvatarQueue     = [];
-        gAssignedNodes   = [];
-        gAssignedAvatars = [];
-        gRetryQueue      = [];
-        gSkippedAvatars  = [];
-        gScannedAvatars  = [];
-        gScannedTimes    = [];
-        gQueueIndex      = 0;
-        gPendingCount    = 0;
+        abort_scan_state();
+        gDisabled       = FALSE;
+        gScannedAvatars = [];
+        gScannedTimes   = [];
 
         gListenHandle = llListen(2, "", llGetOwner(), "");
 
         if (DEBUG >= 1)
-            llOwnerSay("[Coord] Ready. Collecting nodes for " + (string)((integer)NODE_WAIT_DELAY) + "s...");
+            llOwnerSay("[Coord] Ready. Scanning starts now; nodes join as they register.");
 
+        // No collection window: start with whatever nodes are ready (possibly
+        // none) and dispatch to the rest as their MSG_NODE_READY arrives
         llMessageLinked(LINK_ALL_OTHERS, MSG_RESET_NODES, "", NULL_KEY);
-        llSetTimerEvent(NODE_WAIT_DELAY);
+        start_scan();
     }
 
     listen(integer channel, string name, key id, string message)
@@ -264,10 +427,51 @@ default
         {
             gDisabled = FALSE;
             llOwnerSay("[Coord] Scanning enabled.");
-            if (!gScanActive && !gCollectingNodes)
+            if (!gScanActive)
             {
                 start_scan();
             }
+        }
+        else if (message == "hailsAV wipenodes")
+        {
+            integer now = llGetUnixTime();
+            if (now <= gWipeArmedUntil)
+            {
+                gWipeArmedUntil = 0;
+                do_wipe();
+            }
+            else
+            {
+                gWipeArmedUntil = now + 30;
+                llOwnerSay("[Coord] This deletes ALL node scripts from the child prims."
+                    + " Say 'hailsAV wipenodes' again within 30s to confirm.");
+            }
+        }
+        else if (message == "hailsAV deploy")
+        {
+            string scriptName = find_node_script();
+            if (scriptName != "")
+            {
+                gAutoCleanup = FALSE;
+                do_deploy(scriptName);
+            }
+        }
+        else if (message == "hailsAV redeploy")
+        {
+            // Deploy FIRST (same-named scripts are silently replaced in the
+            // prims), clean up old versions after registrations confirm the
+            // loads worked. Never wipe before deploying: a wiped prim has
+            // nothing left to recover with if the loads fail.
+            string scriptName = find_node_script();
+            if (scriptName != "")
+            {
+                gAutoCleanup = TRUE;
+                do_deploy(scriptName);
+            }
+        }
+        else if (message == "hailsAV cleanup")
+        {
+            do_cleanup();
         }
     }
 
@@ -412,10 +616,33 @@ default
     {
         llSetTimerEvent(0.0);
 
-        if (gCollectingNodes)
+        if (gDeployReport)
         {
-            gCollectingNodes = FALSE;
-            start_scan();
+            gDeployReport = FALSE;
+            integer registered = llGetListLength(gReadyNodes);
+            llOwnerSay("[Coord] Deploy check: " + (string)registered + "/"
+                + (string)gDeployTargets + " nodes registered.");
+
+            if (gAutoCleanup && registered >= gDeployTargets)
+            {
+                gAutoCleanup = FALSE;
+                do_cleanup();
+                return;
+            }
+            gAutoCleanup = FALSE;
+
+            if (registered == 0)
+            {
+                llOwnerSay("[Coord] Nothing registered: the remote loads likely failed"
+                    + " (check for shouted DEBUG_CHANNEL errors). The staged copy is"
+                    + " still in the root prim; nothing was deleted.");
+            }
+            else
+            {
+                llOwnerSay("[Coord] Stragglers re-register via heartbeat (up to 10 min)."
+                    + " When satisfied, say 'hailsAV cleanup' to purge old versions,"
+                    + " remove the staged root copy, and start scanning.");
+            }
             return;
         }
 
@@ -442,23 +669,12 @@ default
         }
         else if (change & CHANGED_LINK)
         {
-            // Link numbers may have shifted — re-collect all nodes
+            // Link numbers may have shifted — reset all nodes and restart.
             // Cooldown history (gScannedAvatars/gScannedTimes) is preserved
-            llSetTimerEvent(0.0);
-            gAvatarQueue     = [];
-            gQueueIndex      = 0;
-            gPendingCount    = 0;
-            gReadyNodes      = [];
-            gAssignedNodes   = [];
-            gAssignedAvatars = [];
-            gRetryQueue      = [];
-            gSkippedAvatars  = [];
-            gScanActive      = FALSE;
-            gWaitingToRescan = FALSE;
-            gCollectingNodes = TRUE;
+            abort_scan_state();
             llMessageLinked(LINK_ALL_OTHERS, MSG_RESET_NODES, "", NULL_KEY);
-            llSetTimerEvent(NODE_WAIT_DELAY);
-            if (DEBUG >= 1) llOwnerSay("[Coord] Linkset changed. Re-collecting nodes...");
+            if (DEBUG >= 1) llOwnerSay("[Coord] Linkset changed. Restarting scan; nodes rejoin as they register.");
+            start_scan();
         }
     }
 }

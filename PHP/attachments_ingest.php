@@ -43,25 +43,6 @@ function normalize_string($value, int $maxLength = 255): string
     return substr($value, 0, $maxLength);
 }
 
-function build_data_hash(string $avatarName, string $attachmentName, string $attachmentDesc, int $attachedPoint): string
-{
-    $hashSource = json_encode(
-        [
-            'avatar_name' => $avatarName,
-            'attachment_name' => $attachmentName,
-            'attachment_desc' => $attachmentDesc,
-            'attached_point' => $attachedPoint
-        ],
-        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-    );
-
-    if ($hashSource === false) {
-        $hashSource = $avatarName . '|' . $attachmentName . '|' . $attachmentDesc . '|' . $attachedPoint;
-    }
-
-    return hash('sha256', $hashSource);
-}
-
 $rawInput = file_get_contents('php://input');
 if ($rawInput === false || trim($rawInput) === '') {
     respond_and_exit('No request body received', 400);
@@ -91,46 +72,22 @@ if ($mysqli->connect_errno) {
 
 $mysqli->set_charset('utf8mb4');
 
-$selectStmt = $mysqli->prepare("
-    SELECT id, avatar_name, attachment_name, attachment_desc, attached_point, data_hash, first_seen_utc, changed_utc
-    FROM attachments_current
-    WHERE avatar_uuid = ? AND attachment_uuid = ?
-    LIMIT 1
+$insertStagingStmt = $mysqli->prepare("
+    INSERT INTO ingest_staging (
+        avatar_uuid, avatar_name, object_name, object_desc, attach_point, received_utc
+    ) VALUES (UNHEX(REPLACE(?, '-', '')), ?, ?, ?, ?, UTC_TIMESTAMP())
 ");
 
-$insertCurrentStmt = $mysqli->prepare("
-    INSERT INTO attachments_current (
-        avatar_uuid, avatar_name, attachment_uuid, attachment_name,
-        attachment_desc, attached_point, data_hash,
-        first_seen_utc, changed_utc
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())
-");
-
-$insertStaleStmt = $mysqli->prepare("
-    INSERT INTO stale_attachments (
-        current_row_id, avatar_uuid, avatar_name,
-        attachment_uuid, attachment_name, attachment_desc,
-        attached_point, data_hash,
-        first_seen_utc, changed_utc, stale_moved_utc
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
-");
-
-$updateCurrentStmt = $mysqli->prepare("
-    UPDATE attachments_current
-    SET avatar_name = ?, attachment_name = ?, attachment_desc = ?, attached_point = ?, data_hash = ?, changed_utc = UTC_TIMESTAMP()
-    WHERE id = ?
-");
-
-if (!$selectStmt || !$insertCurrentStmt || !$insertStaleStmt || !$updateCurrentStmt) {
+if (!$insertStagingStmt) {
     respond_and_exit('Statement preparation failed: ' . $mysqli->error, 500);
 }
 
-$inserted = 0;
-$updated = 0;
-$ignored = 0;
+$received = 0;
 $invalid = 0;
 
 try {
+    // Phase 1: land the raw rows in ingest_staging and commit immediately.
+    // Once committed the data is safe even if processing below fails.
     $mysqli->begin_transaction();
 
     foreach ($records as $record) {
@@ -145,84 +102,67 @@ try {
         $attachmentUuid = normalize_uuid($record['attachment_uuid'] ?? '');
         $attachmentName = normalize_string($record['attachment_name'] ?? '');
         $attachmentDesc = normalize_string($record['attachment_desc'] ?? '');
-        $attachedPoint = (int)($record['attached_point'] ?? 0);
+        $attachedPoint = max(0, min(255, (int)($record['attached_point'] ?? 0)));
 
+        // attachment_uuid is validated to prove the record is well-formed,
+        // but not stored: it changes on every relog so it carries no identity
         if ($avatarUuid === '' || $avatarName === '' || $attachmentUuid === '' || $attachmentName === '') {
             $invalid++;
             continue;
         }
 
-        $dataHash = build_data_hash($avatarName, $attachmentName, $attachmentDesc, $attachedPoint);
-
-        $selectStmt->bind_param('ss', $avatarUuid, $attachmentUuid);
-        $selectStmt->execute();
-        $result = $selectStmt->get_result();
-        $existing = $result ? $result->fetch_assoc() : null;
-      
-        if (!$existing) {
-            $insertCurrentStmt->bind_param(
-                'sssssis',
-                $avatarUuid,
-                $avatarName,
-                $attachmentUuid,
-                $attachmentName,
-                $attachmentDesc,
-                $attachedPoint,
-                $dataHash
-            );
-            $insertCurrentStmt->execute();
-            $inserted++;
-            continue;
-        }
-
-        if (hash_equals((string)$existing['data_hash'], $dataHash)) {
-            $ignored++;
-            continue;
-        }
-
-        $insertStaleStmt->bind_param(
-            'isssssisss',
-            $existing['id'],
+        $insertStagingStmt->bind_param(
+            'ssssi',
             $avatarUuid,
-            $existing['avatar_name'],
-            $attachmentUuid,
-            $existing['attachment_name'],
-            $existing['attachment_desc'],
-            $existing['attached_point'],
-            $existing['data_hash'],
-            $existing['first_seen_utc'],
-            $existing['changed_utc']
-        );
-        $insertStaleStmt->execute();
-
-        $updateCurrentStmt->bind_param(
-            'sssisi',
             $avatarName,
             $attachmentName,
             $attachmentDesc,
-            $attachedPoint,
-            $dataHash,
-            $existing['id']
+            $attachedPoint
         );
-        $updateCurrentStmt->execute();
-
-        $updated++;
+        $insertStagingStmt->execute();
+        $received++;
     }
 
     $mysqli->commit();
 
-    respond_and_exit(
-        "Data received successfully"
-        . " | inserted={$inserted} updated={$updated} ignored={$ignored} invalid={$invalid}"
-    );
-
 } catch (Throwable $e) {
     $mysqli->rollback();
-    respond_and_exit('Server exception: ' . $e->getMessage(), 500);
-} finally {
-    $selectStmt->close();
-    $insertCurrentStmt->close();
-    $insertStaleStmt->close();
-    $updateCurrentStmt->close();
+    $insertStagingStmt->close();
     $mysqli->close();
+    respond_and_exit('Server exception: ' . $e->getMessage(), 500);
 }
+
+// Phase 2: drain staging into the normalized tables. Runs in autocommit so
+// each statement inside the procedure holds its locks as briefly as possible.
+// Parallel scanner nodes can deadlock each other here (1213) or time out
+// (1205); that is harmless because the procedure is idempotent and the rows
+// are already committed to staging, so the next ingest call picks them up.
+$processed = 'no records';
+
+if ($received > 0) {
+    $processed = 'deferred';
+
+    for ($attempt = 1; $attempt <= 3; $attempt++) {
+        try {
+            $mysqli->query('CALL sp_process_staging()');
+            while ($mysqli->more_results() && $mysqli->next_result()) {
+                // flush any extra result sets the CALL produces
+            }
+            $processed = 'yes';
+            break;
+        } catch (mysqli_sql_exception $e) {
+            if (!in_array($e->getCode(), [1213, 1205], true) || $attempt === 3) {
+                break;
+            }
+            usleep(100000 * $attempt);
+        }
+    }
+}
+
+$insertStagingStmt->close();
+$mysqli->close();
+
+respond_and_exit(
+    "Data received successfully"
+    . " | received={$received} invalid={$invalid} processed={$processed}"
+);
