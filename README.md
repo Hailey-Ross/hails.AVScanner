@@ -19,8 +19,10 @@ Scan nearby avatars in Second Life, collect visible attachment data, and stream 
 
 | Path | Contents |
 |---|---|
-| `LSL/hails.AVScanner-Coordinator.lsl` | In-world script for the root prim |
-| `LSL/hails.AVScanner-Node.lsl` | In-world script for each child prim |
+| `LSL/hails.AVScanner-Coordinator.lsl` | In-world script for the root prim (Coordinator A) |
+| `LSL/hails.AVScanner-Coordinator-B.lsl` | In-world script for the Coordinator B child prim (dual-coordinator mode) |
+| `LSL/hails.AVScanner-Deployer.lsl` | In-world script for the root prim; manages remote node script deployment |
+| `LSL/hails.AVScanner-Node.lsl` | In-world script for each node child prim |
 | `PHP/attachments_ingest.php` | Backend ingest endpoint the nodes POST to |
 | `Secure/config.php` | Backend config template (DB credentials + API key); deploy it **outside your web root** |
 | `SQL/run_me_first.sql` | Database schema: tables, `sp_process_staging()`, and stats views |
@@ -32,13 +34,19 @@ Scan nearby avatars in Second Life, collect visible attachment data, and stream 
 
 ## Architecture
 
-The system uses a **coordinator + node** model across a multi-prim linkset. The root prim runs the Coordinator; each child prim runs a Node. Nodes work in parallel on the lookup side, but all nodes share one outbound HTTP budget: LSL throttles `llHTTPRequest` at **25 requests per 20 seconds per object** (the whole linkset, not per script). Nodes automatically pace their sends to stay under it, so throughput comes from batching records per request rather than from adding more prims.
+The system uses a **dual-coordinator + node** model across a multi-prim linkset. The root prim runs Coordinator A and the Deployer; a designated child prim runs Coordinator B; every other child prim runs a Node.
+
+The two coordinators split the node pool by link slot: Coordinator A owns slot-0 nodes (link offset from `NODE_START_LINK` mod `NUM_COORDINATORS` == 0) and Coordinator B owns slot-1 nodes (mod == 1). Coordinator B does not manage the scan queue directly; it requests avatar assignments from Coordinator A one at a time via the inter-coordinator protocol. Both coordinators cap concurrent assignments at `MAX_ACTIVE_WORKERS` (default 10).
+
+Nodes work in parallel on the lookup side, but all nodes share one outbound HTTP budget: LSL throttles `llHTTPRequest` at **25 requests per 20 seconds per object** (the whole linkset, not per script). Nodes automatically pace their sends to stay under it, so throughput comes from batching records per request rather than from adding more prims.
 
 ### Scripts
 
 | Script | Role |
 |---|---|
-| `hails.AVScanner-Coordinator.lsl` | Builds avatar queue, dispatches assignments to ready nodes, tracks completion, rescans on timer |
+| `hails.AVScanner-Coordinator.lsl` | Builds avatar queue, dispatches assignments to slot-0 nodes and to Coordinator B, tracks completion, rescans on timer |
+| `hails.AVScanner-Coordinator-B.lsl` | Manages the slot-1 half of the node pool; requests avatar assignments from Coordinator A one at a time |
+| `hails.AVScanner-Deployer.lsl` | Runs in the root prim alongside Coordinator A; pushes node scripts to child prims via `llRemoteLoadScriptPin` |
 | `hails.AVScanner-Node.lsl` | Receives one avatar per assignment, collects attachments, POSTs to API in batched chunks, paces sends against the object-wide HTTP throttle with backoff and retry |
 | ~~`hails.AVScanner-Alpha.lsl`~~ | **Deprecated. Do not use.** Replaced by the coordinator/node system. |
 
@@ -55,8 +63,13 @@ Coordinator and nodes communicate via `llMessageLinked` using large random integ
 | `MSG_RESET_NODES` | 1210977 | Coordinator → Nodes | Reset all node state on startup or linkset change |
 | `MSG_ABORT_SCAN` | 2798014 | Coordinator → Nodes | Abort current work (owner/region change) |
 | `MSG_SET_DEBUG` | 4927361 | Coordinator → Nodes | Relay debug level change to all nodes |
-| `MSG_SET_PACING` | 6602143 | Coordinator → Nodes | Concurrent worker count for HTTP send pacing (min of ready nodes, queued avatars, and `MAX_ACTIVE_WORKERS`), broadcast at scan start and re-broadcast as late-registering workers ramp the count up |
+| `MSG_SET_PACING` | 6602143 | Coordinator → Nodes | Concurrent worker count for HTTP send pacing (minimum of ready nodes, queued avatars, and `MAX_ACTIVE_WORKERS`), broadcast at scan start and re-broadcast as late-registering workers ramp the count up |
 | `MSG_WIPE_NODES` | 7245013 | Coordinator → Nodes | Node-script cleanup in each prim. `str` = script name to keep (cleanup after deploy); empty `str` = delete everything including self (full wipe) |
+| `MSG_COORD_REQUEST` | 9341782 | Coord B → Coord A | Coordinator B has a ready node and requests an avatar assignment |
+| `MSG_COORD_ASSIGN` | 4862305 | Coord A → Coord B | Coordinator A assigns an avatar UUID to Coordinator B |
+| `MSG_COORD_DONE` | 6183947 | Coord B → Coord A | Coordinator B reports a node completed its avatar scan |
+| `MSG_COORD_ERROR` | 3729516 | Coord B → Coord A | Coordinator B reports a node failed its avatar scan |
+| `MSG_SCAN_STARTED` | 5094821 | Coord A → Coord B | Coordinator A notifies Coordinator B that a new scan cycle has begun |
 
 > **Do not change these to small sequential integers.** Prior incident: small values collided with other scripts sharing the linkset, causing nodes to reset instead of scan.
 
@@ -64,37 +77,46 @@ Coordinator and nodes communicate via `llMessageLinked` using large random integ
 
 ## Data Flow
 
-1. Coordinator scans the region with `llGetAgentList`
-2. Avatars already scanned within the last 3 minutes are skipped (cooldown)
-3. Queued avatar UUIDs are dispatched to ready nodes one at a time, with at most `MAX_ACTIVE_WORKERS` (default 10) avatars in flight at once
+1. Coordinator A scans the region with `llGetAgentList`
+2. Avatars already scanned within the last 3 minutes are skipped (cooldown); the cooldown list is pruned in-place at the start of each cycle to avoid unbounded memory growth
+3. Queued avatar UUIDs are dispatched to ready nodes one at a time, with at most `MAX_ACTIVE_WORKERS` (default 10) avatars per coordinator in flight at once. Coordinator A handles slot-0 nodes directly; it also responds to `MSG_COORD_REQUEST` from Coordinator B to serve slot-1 nodes
 4. Each node fetches the avatar's attachment list via `llGetAttachedList`
 5. Attachment details are POSTed to the API in batches (`MAX_RECORDS_PER_REQUEST`, default 8), with each node spacing its sends by `REQUEST_DELAY * concurrent workers` to respect the object-wide throttle (idle nodes don't count against pacing)
 6. The API commits the raw records to `ingest_staging`, then `sp_process_staging()` normalises them into `avatars`, `avatar_names`, `objects`, and `sightings`
 7. If a send is throttled or fails in transit (`llHTTPRequest` returns `NULL_KEY`, or HTTP 420/429/499/503), the node backs off with jitter and retries the same chunk
 8. Node reports done/error, re-registers as ready, and watchdog timer resets
-9. Coordinator rescans after `RESCAN_DELAY` (default 30s) once all nodes finish
+9. Coordinator A rescans after `RESCAN_DELAY` (default 30s) once all nodes and Coordinator B finish
 
 ---
 
 ## System Components
 
-### 1. Coordinator (`hails.AVScanner-Coordinator.lsl`)
+### 1. Coordinator A (`hails.AVScanner-Coordinator.lsl`)
 
 - Runs in the root prim of the linkset
 - Calls `llGetAgentList(AGENT_LIST_REGION, [])` to build the scan queue
-- Skips avatars scanned within `SCAN_COOLDOWN` (180 seconds) to avoid redundant work
-- Dispatches avatar UUIDs to ready nodes via linked messages, capped at `MAX_ACTIVE_WORKERS` (10) concurrent assignments to avoid burst-flooding the backend
-- Tracks pending count; calls `finish_scan()` when all nodes have reported back
+- Skips avatars scanned within `SCAN_COOLDOWN` (180 seconds) to avoid redundant work; prunes the cooldown list in-place at scan start to keep memory flat
+- Dispatches avatar UUIDs to slot-0 nodes, capped at `MAX_ACTIVE_WORKERS` (10) concurrent assignments
+- Also serves avatar assignments to Coordinator B on demand via `MSG_COORD_REQUEST` / `MSG_COORD_ASSIGN`
+- Tracks pending count across both direct nodes and Coordinator B; calls `finish_scan()` when all have reported back
 - Listens on **channel 2** for owner chat commands (see Commands section)
 - Resets automatically on owner, region, or linkset change
 - On linkset change (`CHANGED_LINK`): clears node lists, re-broadcasts `MSG_RESET_NODES`, and re-collects all nodes while preserving cooldown history
 
-### 2. Node (`hails.AVScanner-Node.lsl`)
+### 2. Coordinator B (`hails.AVScanner-Coordinator-B.lsl`)
 
-- One copy per child prim; more prims parallelise lookups, but HTTP capacity is fixed per object
+- Runs in a designated child prim (set `COORD_B_LINK` in all scripts to match its link number)
+- Manages slot-1 nodes (link offset from `NODE_START_LINK` mod `NUM_COORDINATORS` == 1)
+- Does not manage the avatar scan queue; requests assignments from Coordinator A one at a time via `MSG_COORD_REQUEST` / `MSG_COORD_ASSIGN`
+- Caps concurrent assignments at `MAX_ACTIVE_WORKERS` (10); nodes that register while all slots are full wait in the ready pool until a slot frees
+- Reports per-avatar completion (`MSG_COORD_DONE` / `MSG_COORD_ERROR`) back to Coordinator A so cooldown records stay centralised in one place
+
+### 3. Node (`hails.AVScanner-Node.lsl`)
+
+- One copy per node child prim; more prims parallelise lookups, but HTTP capacity is fixed per object
 - Handles one avatar at a time
 - Fetches `llGetAttachedList` and iterates attachments in chunks
-- Paces HTTP sends using the concurrent worker count broadcast by the coordinator (`MSG_SET_PACING`)
+- Paces HTTP sends using the concurrent worker count broadcast by Coordinator A (`MSG_SET_PACING`)
 - Retries throttled or failed sends (`NULL_KEY` return or HTTP 420/429/499/503) with configurable backoff (`THROTTLE_BACKOFF` + jitter), up to `MAX_THROTTLE_RETRIES` consecutive attempts per chunk
 - **Idle heartbeat**: an unneeded node sits quiet waiting for work; if no coordinator message arrives within `WATCHDOG_TIMEOUT` (600s / 10 minutes), it turns yellow and re-registers itself automatically
 - On linkset change (`CHANGED_LINK`): updates its link number; re-registration follows when the coordinator sends `MSG_RESET_NODES`
@@ -111,7 +133,7 @@ integer WATCHDOG_TIMEOUT        = 600;  // idle heartbeat: re-register after 10 
 float   READY_GRACE             = 15.0; // how long a node shows Ready (green) before going Idle (purple)
 ```
 
-### 3. API Layer (`attachments_ingest.php`)
+### 4. API Layer (`attachments_ingest.php`)
 
 - Accepts JSON POST payloads
 - Validates API key via `hash_equals`
@@ -120,7 +142,7 @@ float   READY_GRACE             = 15.0; // how long a node shows Ready (green) b
 - If processing still fails, the rows stay in staging and the next ingest call drains them
 - Returns counters: `received`, `invalid`, plus `processed=yes|deferred`
 
-### 4. Database (`run_me_first.sql`)
+### 5. Database (`run_me_first.sql`)
 
 Normalised schema. UUIDs are stored as `BINARY(16)`; names and descriptions are stored once and referenced by ID.
 
@@ -144,7 +166,7 @@ Attachment UUIDs change on every relog/reattach, so an item's identity is its na
 
 A sighting counts as "current" when its `last_seen` is within 10 minutes of the avatar's `last_seen` (a full scan of one avatar completes well inside that window).
 
-### 5. Grafana Queries (`SQL/grafana/`)
+### 6. Grafana Queries (`SQL/grafana/`)
 
 Ready-made panel queries for a Grafana dashboard pointed at the scanner database (MySQL data source). Paste them into a panel's SQL editor in **Code** mode.
 
@@ -171,9 +193,10 @@ Type these in local chat on **channel 2** (prefix with `/2`). Only the object ow
 | `hailsAV disable` | Pause scanning after the current cycle completes |
 | `hailsAV enable` | Resume scanning |
 | `hailsAV wipenodes` | Delete ALL node scripts from the child prims. Must be said twice within 30 seconds to confirm |
-| `hailsAV deploy` | Push the staged node script from the root prim into every child prim (same-named scripts are replaced), then report how many nodes registered. Deletes nothing |
+| `hailsAV deploy` | Push the staged node script from the root prim into every node prim, then report how many nodes registered. Deletes nothing |
 | `hailsAV cleanup` | After a verified deploy: purge old node-script versions from the prims (keeping the deployed name), remove the staged copy from the root, and start scanning |
 | `hailsAV redeploy` | `deploy`, then automatic `cleanup` if every prim registered; otherwise it leaves everything in place and tells you to run `cleanup` manually |
+| `hailsAV deploy-coord` | Push coordinator scripts from the root prim to their respective prims: Coordinator A script to link 1, Coordinator B script to `COORD_B_LINK`. Scanning resumes when the coordinators restart |
 
 Debug level is relayed to all nodes automatically via `MSG_SET_DEBUG`.
 
@@ -205,14 +228,14 @@ Each node prim tints itself (`llSetColor`, all sides) to show its state at a gla
 
 Typical lifecycle: green on registration, blue while working, green again for a few seconds after each avatar, then purple once the scan no longer needs it, with a yellow blink every 10 minutes. Red is not sticky: it holds through the Ready grace so you can see it, then fades to purple or gets replaced by the next assignment. A node stuck red or blue past the heartbeat interval is genuinely wedged; reset the object.
 
-The coordinator (root) prim does not change color.
+The coordinator prims do not change color.
 
 ---
 
 ## What You'll Need
 
 - **Second Life**
-- **Multi-prim in-world object**: root prim for Coordinator, one or more child prims for Nodes
+- **Multi-prim in-world object**: root prim for Coordinator A and the Deployer, one designated child prim for Coordinator B, and as many additional child prims as you want for Nodes
 - **Webserver**: Apache or Nginx recommended
 - **Database**: MySQL or MariaDB
 - **PHP**: PHP 8+ recommended
@@ -243,16 +266,20 @@ define('ATTACHMENTS_API_KEY','your-secret-key');
 
 Upload `PHP/attachments_ingest.php` to your web root. Update the `require_once` path at the top to point at your config file.
 
-### 4. Configure the Node Script
+### 4. Configure the Scripts
 
 Set `API_URL` and `API_KEY` in `hails.AVScanner-Node.lsl` to match your backend before placing scripts in-world.
 
+Set `COORD_B_LINK` to the link number of your Coordinator B prim in all three scripts that carry it: Coordinator A, Coordinator B, and the Deployer. All must agree.
+
 ### 5. Build the In-World Object
 
-1. Create a linkset with one root prim and as many child prims as you want parallel nodes (2-4 is a reasonable start)
-2. Place `hails.AVScanner-Coordinator.lsl` in the **root prim**
-3. Place `hails.AVScanner-Node.lsl` in each **child prim**
-4. Scripts start automatically; scanning begins immediately with whatever nodes are ready, and the rest join the worker pool as they register (no startup wait)
+1. Create a linkset: one root prim, one child prim designated as Coordinator B, and as many additional child prims as you want for nodes. Each node prim adds parallel lookup capacity; HTTP throughput is fixed per object, so node count mainly affects how fast large avatar queues drain
+2. Note the link number of your Coordinator B prim. Set `COORD_B_LINK` to that value in all three scripts before installing
+3. Place `hails.AVScanner-Coordinator.lsl` and `hails.AVScanner-Deployer.lsl` in the **root prim** (link 1)
+4. Place `hails.AVScanner-Coordinator-B.lsl` in the **Coordinator B child prim**
+5. Place `hails.AVScanner-Node.lsl` in each **remaining child prim**
+6. Scripts start automatically; scanning begins immediately with whatever nodes are ready, and the rest join the worker pool as they register (no startup wait)
 
 You can add or remove node prims at any time. `CHANGED_LINK` triggers automatic re-collection of all nodes.
 
@@ -261,9 +288,11 @@ You can add or remove node prims at any time. `CHANGED_LINK` triggers automatic 
 After the initial manual install, node script upgrades are one chat command:
 
 1. Drop the new versioned node script (e.g. `hails.AVScanner_Node 2.1`) into the **root prim** alongside the Coordinator. Exactly one script starting with `hails.AVScanner_Node` may be present. The staged copy detects it is in the root prim and stays dormant.
-2. Say `/2 hailsAV redeploy`. The coordinator pushes the copy into every child prim via `llRemoteLoadScriptPin` (same-named scripts are silently replaced), waits 10 seconds, and reports how many nodes registered. If all of them did, it automatically purges old script versions from the prims and removes the staged root copy; otherwise it leaves everything in place and tells you to say `hailsAV cleanup` once you're satisfied.
+2. Say `/2 hailsAV redeploy`. The coordinator pushes the copy into every node prim via `llRemoteLoadScriptPin` (same-named scripts are silently replaced), waits 10 seconds, and reports how many nodes registered. If all of them did, it automatically purges old script versions from the prims and removes the staged root copy; otherwise it leaves everything in place and tells you to say `hailsAV cleanup` once you're satisfied.
 
 The order matters and is deliberate: **deploy first, clean up after verification, never wipe before deploying.** A failed `llRemoteLoadScriptPin` only shouts on the DEBUG_CHANNEL, so node registrations are the only reliable success signal, and nothing is deleted until they confirm the loads worked.
+
+To update coordinator scripts, say `/2 hailsAV deploy-coord`. The Deployer pushes Coordinator A to link 1 and Coordinator B to `COORD_B_LINK`. Scanning pauses while the coordinators restart.
 
 Notes:
 
@@ -305,11 +334,13 @@ Touch the object. The owner can touch to trigger a manual scan at any time. The 
 | Node immediately reports error | Avatar left the region before the node processed them |
 | Repeated throttle retries in debug output | The linkset is at its 25 requests/20s object budget; increase `MAX_RECORDS_PER_REQUEST` (fewer requests for the same data) or raise `REQUEST_DELAY`. Adding more node prims will NOT help |
 | Repeated `HTTP 499` retries | The web server can't keep up with concurrent POSTs; lower `MAX_ACTIVE_WORKERS` in the Coordinator or check backend/PHP performance |
-| Stack-Heap Collision | LSL memory exceeded; reduce `MAX_RECORDS_PER_REQUEST` |
+| Coordinator A stack-heap collision | Reported as a script error in the viewer. Fixed in the current version by in-place list filtering in `start_scan()`. If it recurs on extremely large sims (200+ avatars), lower `SCAN_COOLDOWN` to keep the cooldown history shorter |
+| Coordinator B "Pending" exceeds 10 | Indicates the `MAX_ACTIVE_WORKERS` guard is not applied; ensure the deployed Coordinator B script is current |
 | No data in database | Check API key match, PHP error log, DB connectivity |
 | `ingest_staging` keeps growing | `sp_process_staging()` is failing outright (occasional `processed=deferred` responses are normal; persistent growth is not). Check the procedure exists and the PHP error log |
 | Node stuck blue and not working | The idle heartbeat recovers it within 10 minutes; to recover immediately, reset the object |
 | Same avatar scanned every cycle | Check `SCAN_COOLDOWN` (default 180s between rescans of the same avatar) |
+| Pacing holds over 20 seconds | Ensure the deployed Coordinator A script is current; older versions double-counted worker count via a `NUM_COORDINATORS` multiplier |
 
 ---
 
