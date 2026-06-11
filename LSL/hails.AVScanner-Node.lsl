@@ -25,7 +25,7 @@ integer MAX_RECORDS_PER_REQUEST = 8;
 float   REQUEST_DELAY           = 0.9;
 float   THROTTLE_BACKOFF        = 5.0;
 integer MAX_THROTTLE_RETRIES    = 5;
-integer WATCHDOG_TIMEOUT        = 120;
+integer WATCHDOG_TIMEOUT        = 600;
 float   READY_GRACE             = 15.0;
 
 vector COLOR_READY      = <0.0, 1.0, 0.0>;

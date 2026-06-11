@@ -247,6 +247,7 @@ default
 
     listen(integer channel, string name, key id, string message)
     {
+        if (id != llGetOwner()) return;
         list labels = ["OFF", "ON", "VERBOSE"];
         if (message == "hailsAV debug verbose")
         {

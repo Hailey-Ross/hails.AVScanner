@@ -151,6 +151,7 @@ default
 
     listen(integer channel, string name, key id, string message)
     {
+        if (id != llGetOwner()) return;
         if (message == "hailsAV deploy")
         {
             string s = find_script(NODE_SCRIPT_PREFIX);
